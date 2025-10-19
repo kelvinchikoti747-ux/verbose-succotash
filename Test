@@ -1,0 +1,45 @@
+# verbose-succotash
+Active 
+import React, { useEffect, useState } from 'react';
+import { View, Text, Button, StyleSheet } from 'react-native';
+import { Accelerometer, Gyroscope } from 'expo-sensors';
+
+export default function SensorTest({ onBack }) {
+  const [accel, setAccel] = useState([0,0,0]);
+  const [gyro, setGyro] = useState([0,0,0]);
+  const [enabled, setEnabled] = useState(false);
+
+  useEffect(() => {
+    let subA = null;
+    let subG = null;
+    if (enabled) {
+      Accelerometer.setUpdateInterval(200);
+      Gyroscope.setUpdateInterval(200);
+      subA = Accelerometer.addListener(a => setAccel([a.x.toFixed(3), a.y.toFixed(3), a.z.toFixed(3)]));
+      subG = Gyroscope.addListener(g => setGyro([g.x.toFixed(3), g.y.toFixed(3), g.z.toFixed(3)]));
+    }
+    return () => {
+      subA && subA.remove();
+      subG && subG.remove();
+    };
+  }, [enabled]);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.title}>Sensor Test</Text>
+      <Text style={{marginTop:8}}>Accelerometer: {accel.join(', ')}</Text>
+      <Text style={{marginTop:8}}>Gyroscope: {gyro.join(', ')}</Text>
+      <View style={{marginTop:16}}>
+        <Button title={enabled ? "Stop sensors" : "Start sensors"} onPress={() => setEnabled(e => !e)} />
+      </View>
+      <View style={{marginTop:20}}>
+        <Button title="Back" onPress={() => { setEnabled(false); onBack(); }} />
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {flex:1, padding:16},
+  title: {fontSize:24, fontWeight:'700'}
+});
