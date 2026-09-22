@@ -1,87 +1,1503 @@
-name: Build and Deploy to ACK
+"""
+SECURITY RESEARCH PLATFORM
+==========================
 
-on:
-  push:
-    branches:
-      - main
+Single-file defensive security platform.
 
-env:
-  REGION_ID: cn-hangzhou
-  REGISTRY: registry.cn-hangzhou.aliyuncs.com
-  NAMESPACE: namespace
-  IMAGE: repo
-  TAG: ${{ github.sha }}
-  ACK_CLUSTER_ID: clusterID
-  ACK_DEPLOYMENT_NAME: nginx-deployment
+Run:
+    pip install fastapi uvicorn sqlalchemy python-jose[cryptography] passlib[bcrypt] httpx python-multipart
+    python security_platform.py
 
-permissions:
-  contents: read
+Open:
+    http://127.0.0.1:8000
 
-jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
-    environment: production
+Swagger:
+    http://127.0.0.1:8000/docs
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+Default admin:
+    Email: admin@example.com
+    Password: ChangeThisPassword123!
 
-      - name: Login to ACR
-        uses: aliyun/acr-login@v1
-        with:
-          region-id: ${{ env.REGION_ID }}
-          access-key-id: ${{ secrets.ACCESS_KEY_ID }}
-          access-key-secret: ${{ secrets.ACCESS_KEY_SECRET }}
+IMPORTANT:
+- Change the default password.
+- Change JWT_SECRET.
+- Only register/test systems you own or are explicitly authorized to assess.
+- This version intentionally provides passive/defensive security testing,
+  not unrestricted exploitation, credential attacks, persistence, or malware.
+"""
 
-      - name: Build and push image to ACR
-        run: |
-          docker build \
-            -t "${REGISTRY}/${NAMESPACE}/${IMAGE}:${TAG}" \
-            .
-          docker push \
-            "${REGISTRY}/${NAMESPACE}/${IMAGE}:${TAG}"
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+import hashlib
+import json
+import os
 
-      - name: Scan image in ACR
-        uses: aliyun/acr-scan@v1
-        with:
-          region-id: ${{ env.REGION_ID }}
+import httpx
 
-      - name: Configure Alibaba Cloud credentials
-        uses: aliyun/configure-aliyun-credentials-action@v1
-        with:
-          access-key-id: ${{ secrets.ACCESS_KEY_ID }}
-          access-key-secret: ${{ secrets.ACCESS_KEY_SECRET }}
-          region-id: ${{ env.REGION_ID }}
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    status,
+)
 
-      - name: Install Alibaba Cloud CLI
-        run: |
-          curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz -o aliyun-cli.tgz
-          tar -xzf aliyun-cli.tgz
-          sudo mv aliyun /usr/local/bin/aliyun
-          aliyun version
+from fastapi.responses import HTMLResponse
 
-      - name: Get ACK kubeconfig
-        run: |
-          aliyun cs GET \
-            --ClusterId "${ACK_CLUSTER_ID}" \
-            --format yaml > kubeconfig.yaml
+from fastapi.security import OAuth2PasswordBearer
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+from jose import JWTError, jwt
 
-      - name: Configure kubectl
-        run: |
-          mkdir -p "$HOME/.kube"
-          cp kubeconfig.yaml "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
+from passlib.context import CryptContext
 
-      - name: Update deployment image
-        run: |
-          kubectl set image deployment/"${ACK_DEPLOYMENT_NAME}" \
-            "${IMAGE}"="${REGISTRY}/${NAMESPACE}/${IMAGE}:${TAG}"
+from pydantic import BaseModel, EmailStr
 
-      - name: Wait for deployment
-        run: |
-          kubectl rollout status \
-            deployment/"${ACK_DEPLOYMENT_NAME}" \
-            --timeout=180s
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    select,
+)
+
+from sqlalchemy.orm import (
+    Session,
+    declarative_base,
+    sessionmaker,
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./security_platform.db"
+)
+
+JWT_SECRET = os.getenv(
+    "JWT_SECRET",
+    "CHANGE_THIS_SECRET_BEFORE_PRODUCTION"
+)
+
+JWT_ALGORITHM = "HS256"
+
+ACCESS_TOKEN_MINUTES = int(
+    os.getenv(
+        "ACCESS_TOKEN_MINUTES",
+        "60"
+    )
+)
+
+ADMIN_EMAIL = os.getenv(
+    "ADMIN_EMAIL",
+    "admin@example.com"
+)
+
+ADMIN_PASSWORD = os.getenv(
+    "ADMIN_PASSWORD",
+    "ChangeThisPassword123!"
+)
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+connect_args = {}
+
+if DATABASE_URL.startswith("sqlite"):
+    connect_args = {
+        "check_same_thread": False
+    }
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False
+)
+
+Base = declarative_base()
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+
+def get_db():
+    db = SessionLocal()
+
+    try:
+        yield db
+
+    finally:
+        db.close()
+
+
+# ============================================================
+# DATABASE MODELS
+# ============================================================
+
+class User(Base):
+
+    __tablename__ = "users"
+
+    id = Column(
+        Integer,
+        primary_key=True
+    )
+
+    email = Column(
+        String(255),
+        unique=True,
+        nullable=False,
+        index=True
+    )
+
+    password_hash = Column(
+        String(255),
+        nullable=False
+    )
+
+    role = Column(
+        String(50),
+        nullable=False,
+        default="analyst"
+    )
+
+    active = Column(
+        Boolean,
+        default=True
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utcnow
+    )
+
+
+class Scope(Base):
+
+    __tablename__ = "scopes"
+
+    id = Column(
+        Integer,
+        primary_key=True
+    )
+
+    name = Column(
+        String(255),
+        nullable=False
+    )
+
+    target = Column(
+        String(500),
+        nullable=False
+    )
+
+    owner = Column(
+        String(255),
+        nullable=True
+    )
+
+    authorized = Column(
+        Boolean,
+        default=False,
+        nullable=False
+    )
+
+    notes = Column(
+        Text,
+        nullable=True
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utcnow
+    )
+
+
+class Asset(Base):
+
+    __tablename__ = "assets"
+
+    id = Column(
+        Integer,
+        primary_key=True
+    )
+
+    scope_id = Column(
+        Integer,
+        ForeignKey("scopes.id"),
+        nullable=False
+    )
+
+    name = Column(
+        String(255),
+        nullable=False
+    )
+
+    kind = Column(
+        String(100),
+        nullable=False
+    )
+
+    address = Column(
+        String(500),
+        nullable=False
+    )
+
+    notes = Column(
+        Text,
+        nullable=True
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utcnow
+    )
+
+
+class Finding(Base):
+
+    __tablename__ = "findings"
+
+    id = Column(
+        Integer,
+        primary_key=True
+    )
+
+    scope_id = Column(
+        Integer,
+        ForeignKey("scopes.id"),
+        nullable=False
+    )
+
+    title = Column(
+        String(255),
+        nullable=False
+    )
+
+    severity = Column(
+        String(30),
+        nullable=False
+    )
+
+    description = Column(
+        Text,
+        nullable=False
+    )
+
+    remediation = Column(
+        Text,
+        nullable=True
+    )
+
+    status = Column(
+        String(30),
+        default="open"
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utcnow
+    )
+
+
+class AuditLog(Base):
+
+    __tablename__ = "audit_logs"
+
+    id = Column(
+        Integer,
+        primary_key=True
+    )
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=True
+    )
+
+    action = Column(
+        String(255),
+        nullable=False
+    )
+
+    target = Column(
+        String(500),
+        nullable=True
+    )
+
+    details = Column(
+        Text,
+        nullable=True
+    )
+
+    created_at = Column(
+        DateTime(timezone=True),
+        default=utcnow
+    )
+
+
+# ============================================================
+# CREATE DATABASE
+# ============================================================
+
+Base.metadata.create_all(
+    bind=engine
+)
+
+
+# ============================================================
+# PASSWORD / AUTHENTICATION
+# ============================================================
+
+password_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="/auth/login"
+)
+
+
+def hash_password(password):
+
+    return password_context.hash(
+        password
+    )
+
+
+def verify_password(
+    password,
+    password_hash
+):
+
+    return password_context.verify(
+        password,
+        password_hash
+    )
+
+
+def create_token(user):
+
+    expiration = (
+        datetime.now(timezone.utc)
+        + timedelta(
+            minutes=ACCESS_TOKEN_MINUTES
+        )
+    )
+
+    payload = {
+        "sub": str(user.id),
+        "role": user.role,
+        "exp": expiration
+    }
+
+    return jwt.encode(
+        payload,
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+
+
+def get_current_user(
+    token=Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+):
+
+    authentication_error = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid authentication credentials"
+    )
+
+    try:
+
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM]
+        )
+
+        user_id = int(
+            payload["sub"]
+        )
+
+    except (
+        JWTError,
+        KeyError,
+        ValueError
+    ):
+
+        raise authentication_error
+
+    user = db.scalar(
+        select(User).where(
+            User.id == user_id
+        )
+    )
+
+    if not user or not user.active:
+
+        raise authentication_error
+
+    return user
+
+
+def require_roles(*allowed_roles):
+
+    def checker(
+        user=Depends(
+            get_current_user
+        )
+    ):
+
+        if user.role not in allowed_roles:
+
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient permissions"
+            )
+
+        return user
+
+    return checker
+
+
+# ============================================================
+# AUDIT LOGGING
+# ============================================================
+
+def audit(
+    db,
+    user_id,
+    action,
+    target=None,
+    details=None
+):
+
+    entry = AuditLog(
+        user_id=user_id,
+        action=action,
+        target=target,
+        details=(
+            json.dumps(details)
+            if details is not None
+            else None
+        )
+    )
+
+    db.add(entry)
+    db.commit()
+
+
+# ============================================================
+# PYDANTIC REQUEST MODELS
+# ============================================================
+
+class LoginRequest(BaseModel):
+
+    email: EmailStr
+    password: str
+
+
+class UserCreate(BaseModel):
+
+    email: EmailStr
+    password: str
+    role: str = "analyst"
+
+
+class ScopeCreate(BaseModel):
+
+    name: str
+    target: str
+    owner: str | None = None
+    authorized: bool = False
+    notes: str | None = None
+
+
+class AssetCreate(BaseModel):
+
+    scope_id: int
+    name: str
+    kind: str
+    address: str
+    notes: str | None = None
+
+
+class FindingCreate(BaseModel):
+
+    scope_id: int
+    title: str
+    severity: str
+    description: str
+    remediation: str | None = None
+
+
+class HTTPAssessment(BaseModel):
+
+    scope_id: int
+    url: str
+
+
+class HashRequest(BaseModel):
+
+    path: str
+
+
+# ============================================================
+# APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="Security Research Platform",
+    description=(
+        "Authorized defensive security "
+        "research and assessment platform."
+    ),
+    version="1.0.0"
+)
+
+
+# ============================================================
+# INITIAL ADMIN
+# ============================================================
+
+def create_initial_admin():
+
+    db = SessionLocal()
+
+    try:
+
+        existing = db.scalar(
+            select(User).where(
+                User.email == ADMIN_EMAIL
+            )
+        )
+
+        if existing:
+            return
+
+        admin = User(
+            email=ADMIN_EMAIL,
+            password_hash=hash_password(
+                ADMIN_PASSWORD
+            ),
+            role="admin",
+            active=True
+        )
+
+        db.add(admin)
+        db.commit()
+
+        print(
+            "Initial admin created:"
+        )
+
+        print(
+            f"Email: {ADMIN_EMAIL}"
+        )
+
+        print(
+            "Change the default password immediately."
+        )
+
+    finally:
+
+        db.close()
+
+
+create_initial_admin()
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return {
+        "status": "ok",
+        "application": "Security Research Platform",
+        "version": "1.0.0"
+    }
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.post("/auth/login")
+def login(
+    data: LoginRequest,
+    db: Session = Depends(get_db)
+):
+
+    user = db.scalar(
+        select(User).where(
+            User.email == data.email
+        )
+    )
+
+    if not user:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    if not verify_password(
+        data.password,
+        user.password_hash
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password"
+        )
+
+    token = create_token(
+        user
+    )
+
+    audit(
+        db,
+        user.id,
+        "login"
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer"
+    }
+
+
+# ============================================================
+# CURRENT USER
+# ============================================================
+
+@app.get("/me")
+def current_user(
+    user=Depends(
+        get_current_user
+    )
+):
+
+    return {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role,
+        "active": user.active
+    }
+
+
+# ============================================================
+# USERS
+# ============================================================
+
+@app.post("/users")
+def create_user(
+    data: UserCreate,
+    db: Session = Depends(get_db),
+    admin=Depends(
+        require_roles("admin")
+    )
+):
+
+    allowed_roles = {
+        "admin",
+        "analyst",
+        "pentester",
+        "auditor"
+    }
+
+    if data.role not in allowed_roles:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid role"
+        )
+
+    existing = db.scalar(
+        select(User).where(
+            User.email == data.email
+        )
+    )
+
+    if existing:
+
+        raise HTTPException(
+            status_code=409,
+            detail="User already exists"
+        )
+
+    user = User(
+        email=data.email,
+        password_hash=hash_password(
+            data.password
+        ),
+        role=data.role,
+        active=True
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    audit(
+        db,
+        admin.id,
+        "create_user",
+        user.email,
+        {
+            "role": user.role
+        }
+    )
+
+    return {
+        "id": user.id,
+        "email": user.email,
+        "role": user.role
+    }
+
+
+# ============================================================
+# AUTHORIZED SCOPES
+# ============================================================
+
+@app.post("/scopes")
+def create_scope(
+    data: ScopeCreate,
+    db: Session = Depends(get_db),
+    user=Depends(
+        require_roles(
+            "admin",
+            "analyst",
+            "pentester"
+        )
+    )
+):
+
+    scope = Scope(
+        name=data.name,
+        target=data.target,
+        owner=data.owner,
+        authorized=data.authorized,
+        notes=data.notes
+    )
+
+    db.add(scope)
+    db.commit()
+    db.refresh(scope)
+
+    audit(
+        db,
+        user.id,
+        "create_scope",
+        scope.target,
+        {
+            "authorized":
+                scope.authorized
+        }
+    )
+
+    return scope
+
+
+@app.get("/scopes")
+def list_scopes(
+    db: Session = Depends(get_db),
+    user=Depends(
+        get_current_user
+    )
+):
+
+    return db.scalars(
+        select(Scope)
+        .order_by(
+            Scope.id.desc()
+        )
+    ).all()
+
+
+# ============================================================
+# ASSETS
+# ============================================================
+
+@app.post("/assets")
+def create_asset(
+    data: AssetCreate,
+    db: Session = Depends(get_db),
+    user=Depends(
+        require_roles(
+            "admin",
+            "analyst",
+            "pentester"
+        )
+    )
+):
+
+    scope = db.get(
+        Scope,
+        data.scope_id
+    )
+
+    if not scope:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Scope not found"
+        )
+
+    asset = Asset(
+        scope_id=data.scope_id,
+        name=data.name,
+        kind=data.kind,
+        address=data.address,
+        notes=data.notes
+    )
+
+    db.add(asset)
+    db.commit()
+    db.refresh(asset)
+
+    audit(
+        db,
+        user.id,
+        "create_asset",
+        asset.address
+    )
+
+    return asset
+
+
+@app.get("/assets")
+def list_assets(
+    db: Session = Depends(get_db),
+    user=Depends(
+        get_current_user
+    )
+):
+
+    return db.scalars(
+        select(Asset)
+        .order_by(
+            Asset.id.desc()
+        )
+    ).all()
+
+
+# ============================================================
+# FINDINGS
+# ============================================================
+
+@app.post("/findings")
+def create_finding(
+    data: FindingCreate,
+    db: Session = Depends(get_db),
+    user=Depends(
+        require_roles(
+            "admin",
+            "analyst",
+            "pentester"
+        )
+    )
+):
+
+    scope = db.get(
+        Scope,
+        data.scope_id
+    )
+
+    if not scope:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Scope not found"
+        )
+
+    finding = Finding(
+        scope_id=data.scope_id,
+        title=data.title,
+        severity=data.severity,
+        description=data.description,
+        remediation=data.remediation,
+        status="open"
+    )
+
+    db.add(finding)
+    db.commit()
+    db.refresh(finding)
+
+    audit(
+        db,
+        user.id,
+        "create_finding",
+        finding.title,
+        {
+            "severity":
+                finding.severity
+        }
+    )
+
+    return finding
+
+
+@app.get("/findings")
+def list_findings(
+    db: Session = Depends(get_db),
+    user=Depends(
+        get_current_user
+    )
+):
+
+    return db.scalars(
+        select(Finding)
+        .order_by(
+            Finding.id.desc()
+        )
+    ).all()
+
+
+# ============================================================
+# PASSIVE HTTP SECURITY ASSESSMENT
+# ============================================================
+
+SECURITY_HEADERS = {
+
+    "strict-transport-security": {
+        "severity": "high",
+        "remediation": (
+            "Enable HSTS for HTTPS services."
+        )
+    },
+
+    "content-security-policy": {
+        "severity": "medium",
+        "remediation": (
+            "Define a restrictive "
+            "Content-Security-Policy."
+        )
+    },
+
+    "x-content-type-options": {
+        "severity": "low",
+        "remediation": (
+            "Set X-Content-Type-Options "
+            "to nosniff."
+        )
+    },
+
+    "x-frame-options": {
+        "severity": "low",
+        "remediation": (
+            "Set X-Frame-Options or "
+            "frame-ancestors in CSP."
+        )
+    },
+
+    "referrer-policy": {
+        "severity": "low",
+        "remediation": (
+            "Set an explicit Referrer-Policy."
+        )
+    }
+}
+
+
+def passive_http_test(url):
+
+    parsed = urlparse(
+        url
+    )
+
+    if parsed.scheme not in {
+        "http",
+        "https"
+    }:
+
+        raise ValueError(
+            "Only HTTP/HTTPS URLs are allowed."
+        )
+
+    if not parsed.hostname:
+
+        raise ValueError(
+            "URL has no hostname."
+        )
+
+    with httpx.Client(
+        timeout=10,
+        follow_redirects=False
+    ) as client:
+
+        response = client.get(
+            url
+        )
+
+    response_headers = {
+        key.lower(): value
+        for key, value
+        in response.headers.items()
+    }
+
+    findings = []
+
+    for header, config in SECURITY_HEADERS.items():
+
+        if header not in response_headers:
+
+            findings.append({
+
+                "title":
+                    f"Missing security header: {header}",
+
+                "severity":
+                    config["severity"],
+
+                "description":
+                    (
+                        f"The endpoint did not "
+                        f"return {header}."
+                    ),
+
+                "remediation":
+                    config["remediation"]
+            })
+
+    if parsed.scheme == "http":
+
+        findings.append({
+
+            "title":
+                "Unencrypted HTTP endpoint",
+
+            "severity":
+                "medium",
+
+            "description":
+                (
+                    "The supplied endpoint "
+                    "uses HTTP."
+                ),
+
+            "remediation":
+                (
+                    "Use HTTPS and redirect "
+                    "HTTP traffic to HTTPS."
+                )
+        })
+
+    return {
+        "url": url,
+        "status_code": response.status_code,
+        "server":
+            response.headers.get(
+                "server"
+            ),
+        "findings": findings
+    }
+
+
+@app.post("/assess/passive-http")
+def assess_http(
+    data: HTTPAssessment,
+    db: Session = Depends(get_db),
+    user=Depends(
+        require_roles(
+            "admin",
+            "analyst",
+            "pentester"
+        )
+    )
+):
+
+    scope = db.get(
+        Scope,
+        data.scope_id
+    )
+
+    if not scope:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Scope not found"
+        )
+
+    if not scope.authorized:
+
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This scope is not marked "
+                "as authorized."
+            )
+        )
+
+    # Basic scope check.
+    if scope.target not in data.url:
+
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Target is outside the "
+                "registered scope."
+            )
+        )
+
+    try:
+
+        result = passive_http_test(
+            data.url
+        )
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    for finding in result["findings"]:
+
+        db.add(
+            Finding(
+                scope_id=scope.id,
+                title=finding["title"],
+                severity=finding["severity"],
+                description=finding["description"],
+                remediation=finding["remediation"],
+                status="open"
+            )
+        )
+
+    db.commit()
+
+    audit(
+        db,
+        user.id,
+        "passive_http_assessment",
+        data.url,
+        {
+            "findings":
+                len(
+                    result["findings"]
+                )
+        }
+    )
+
+    return result
+
+
+# ============================================================
+# SHA-256 EVIDENCE HASH
+# ============================================================
+
+@app.post("/evidence/sha256")
+def hash_evidence(
+    data: HashRequest,
+    user=Depends(
+        require_roles(
+            "admin",
+            "analyst",
+            "pentester"
+        )
+    )
+):
+
+    file_path = Path(
+        data.path
+    ).resolve()
+
+    if not file_path.is_file():
+
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+
+    digest = hashlib.sha256()
+
+    try:
+
+        with file_path.open(
+            "rb"
+        ) as file:
+
+            while True:
+
+                chunk = file.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                digest.update(
+                    chunk
+                )
+
+    except Exception as error:
+
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    return {
+        "file": str(file_path),
+        "sha256":
+            digest.hexdigest()
+    }
+
+
+# ============================================================
+# AUDIT LOG
+# ============================================================
+
+@app.get("/audit")
+def get_audit_logs(
+    db: Session = Depends(get_db),
+    user=Depends(
+        require_roles(
+            "admin",
+            "auditor"
+        )
+    )
+):
+
+    return db.scalars(
+        select(AuditLog)
+        .order_by(
+            AuditLog.id.desc()
+        )
+        .limit(500)
+    ).all()
+
+
+# ============================================================
+# SIMPLE DASHBOARD
+# ============================================================
+
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
+def dashboard():
+
+    return """
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<title>
+Security Research Platform
+</title>
+
+<style>
+
+body {
+    margin: 0;
+    background: #0b1220;
+    color: #e5e7eb;
+    font-family: Arial, sans-serif;
+}
+
+header {
+    padding: 25px;
+    background: #111827;
+}
+
+main {
+    padding: 25px;
+    max-width: 1100px;
+    margin: auto;
+}
+
+.card {
+    background: #172033;
+    padding: 20px;
+    margin: 15px 0;
+    border-radius: 12px;
+}
+
+h1 {
+    margin-top: 0;
+}
+
+code {
+    background: #020617;
+    padding: 4px 7px;
+    border-radius: 5px;
+}
+
+a {
+    color: #60a5fa;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns:
+        repeat(
+            auto-fit,
+            minmax(220px, 1fr)
+        );
+    gap: 15px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<header>
+
+<h1>
+🛡 Security Research Platform
+</h1>
+
+<p>
+Authorized defensive security operations
+</p>
+
+</header>
+
+<main>
+
+<div class="grid">
+
+<div class="card">
+
+<h2>🔐 Authentication</h2>
+
+<p>
+JWT authentication and role-based access.
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>🎯 Scope</h2>
+
+<p>
+Register authorized security-testing targets.
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>🖥 Assets</h2>
+
+<p>
+Maintain an inventory of security assets.
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>🔎 Findings</h2>
+
+<p>
+Track vulnerabilities and remediation.
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>🌐 HTTP Assessment</h2>
+
+<p>
+Perform passive security-header checks.
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>🧾 Evidence</h2>
+
+<p>
+Calculate SHA-256 evidence hashes.
+</p>
+
+</div>
+
+<div class="card">
+
+<h2>📋 Audit</h2>
+
+<p>
+Record security-team actions.
+</p>
+
+</div>
+
+</div>
+
+<div class="card">
+
+<h2>API</h2>
+
+<p>
+Interactive API documentation:
+</p>
+
+<p>
+<a href="/docs">
+Open Swagger UI
+</a>
+</p>
+
+<p>
+Health:
+<a href="/health">
+/health
+</a>
+</p>
+
+</div>
+
+</main>
+
+</body>
+
+</html>
+"""
+
+
+# ============================================================
+# START SERVER
+# ============================================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )
